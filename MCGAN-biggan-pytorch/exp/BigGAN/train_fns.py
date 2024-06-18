@@ -1,0 +1,337 @@
+''' train_fns.py
+Functions for the main loop of training different conditional image models
+'''
+import collections
+import math
+
+import torch
+import torch.nn as nn
+import torchvision
+import os
+import utils
+import losses
+from torch import autograd
+# from template_lib.v2.config import global_cfg
+from template_lib.v2.config_cfgnode import global_cfg
+
+from .loss import *
+
+# Dummy training function for debugging
+def dummy_training_function():
+  def train(x, y):
+    return {}
+  return train
+def compute_grad2(d_out, x_in):
+    
+    batch_size = x_in.size(0)
+    grad_dout = autograd.grad(
+        outputs=d_out.sum(), inputs=x_in,
+        create_graph=True, retain_graph=True, only_inputs=True)[0]
+    grad_dout2 = grad_dout.pow(2)
+    assert (grad_dout2.size() == x_in.size())
+    reg = grad_dout2.view(batch_size, -1).sum(1)
+    return reg
+def gp_reg(dx, gx,y,D, center=1.):
+        batch_size = dx.size(0) 
+        eps = torch.rand(batch_size, device=gx.device).view(batch_size, 1,1,1)
+        x_interp = (1 - eps) * dx + eps * gx
+        x_interp = x_interp.detach()
+        x_interp.requires_grad_()
+        d_out = D(x_interp,y)
+        reg = (compute_grad2(d_out, x_interp).sqrt() - center).pow(2).mean()
+        return reg
+"""
+Log
+05/11: \modify the GAN_training_function function for WGAN training
+       \make the G_D module compatible to WGAN
+       \create W1 Distance
+       
+"""
+def GAN_training_function(G, D, GD, z_, y_, ema, state_dict, config, val_loaders):
+  default_dict = collections.defaultdict(dict)
+  loss_fn = Adversarial_loss[global_cfg.loss.losstype]()
+
+  def train(x, y):
+    #Input:  the x is the real image and y is the label 
+    G.optim.zero_grad()
+    D.optim.zero_grad()
+    device=x.device
+
+    # How many chunks to split x and y into?
+    x = torch.split(x, config['batch_size'])
+    y = torch.split(y, config['batch_size'])
+    counter = 0
+    
+    # Optionally toggle D and G's "require_grad"
+    if config['toggle_grads']:
+      utils.toggle_grad(D, True)
+      utils.toggle_grad(G, False)
+    #################################################################################Train Discriminator #############################################################################################################
+    for step_index in range(config['num_D_steps']):
+      # If accumulating gradients, loop multiple times before an optimizer step
+      D.optim.zero_grad()
+      for accumulation_index in range(config['num_D_accumulations']):                  ###############################config['num_D_accumulations'] is set to be 1 by default 
+        z_.sample_()
+        y_.sample_()
+        #compute the loss for Discriminator
+        D_scores= GD(z_[:config['batch_size']], y_[:config['batch_size']], 
+                            x[counter], y[counter], train_G=False, 
+                            split_D=config['split_D'], policy=config['DiffAugment'],
+                            CR=config['CR'] > 0, CR_augment=config['CR_augment'])#      ##############################'split_D' is set to be False by default.
+                            
+        D_loss_CR = 0
+        if config['CR'] > 0:
+            D_fake, D_real, D_real_CR = D_scores
+            D_loss_CR = torch.mean((D_real_CR - D_real) ** 2) * config['CR']
+        else:
+            D_fake, D_real = D_scores                              ##############################'split_D' is set to be False by default.
+            
+        ###Omni loss for D
+        if global_cfg.loss.losstype=='omni':
+          D_real_positive = [y[counter], config['n_classes']] 
+          # D_real_negative = (config['n_classes'] + 1,)
+          if global_cfg.loss.mode == 'only_p':
+            assert 0, "deprecated"
+            D_loss_real = loss_fn(pred=D_real, positive=D_real_positive, default_label=-1)
+          elif global_cfg.loss.mode == 'p_and_n':
+            D_loss_real = loss_fn(pred=D_real, positive=D_real_positive, default_label=0) 
+          elif global_cfg.loss.mode == 'one_side':
+            D_loss_real = loss_fn(pred=D_real, positive=D_real_positive, default_label=-1)
+          else:
+            assert 0
+
+          D_fake_positive = (config['n_classes'] + 1,)
+          if global_cfg.loss.mode == 'only_p':
+            D_loss_fake = loss_fn(pred=D_fake, positive=D_fake_positive, default_label=-1)
+          elif global_cfg.loss.mode == 'p_and_n':                               ############################################################# mode set as 'p_and_n'
+            D_loss_fake = loss_fn(pred=D_fake, positive=D_fake_positive, default_label=0)
+          elif global_cfg.loss.mode == 'one_side':
+            D_fake_negative = [y_[:config['batch_size']], config['n_classes']]
+            D_loss_fake = loss_fn(pred=D_fake, positive=None, negative=D_fake_negative, default_label=-1)
+          else:
+            assert 0
+
+          D_loss = (D_loss_real + D_loss_fake) / float(config['num_D_accumulations'])
+        ###Hinge Loss for D
+        elif global_cfg.loss.losstype in ['hinge','ns']:
+          D_loss=loss_fn(D_fake,D_real)
+        ############# W1 distance
+        elif global_cfg.loss.losstype=='w1':
+          D_fake,G_z = GD(z_[:config['batch_size']], y_[:config['batch_size']], train_G=True, split_D=config['split_D'],policy=config['DiffAugment'],return_G_z=True)
+          reg=gp_reg(x[counter], G_z, y[counter], D,center=1.)
+          D_loss=loss_fn(D_fake,D_real,reg)
+        
+        D_loss+=D_loss_CR
+        D_loss.backward()
+        counter += 1
+        
+      # Optionally apply ortho reg in D
+      if config['D_ortho'] > 0.0:                                                  ###############################################################By default  'D_ortho'=0 
+        # Debug print to indicate we're using ortho reg in D.
+        print('using modified ortho reg in D')
+        utils.ortho(D, config['D_ortho'])
+      
+      D.optim.step()
+    ##Update D and get the D_real and D_fake
+    out = {'D_real_loss': D_real.mean().item(),
+           'D_fake_loss': D_fake.mean().item(),
+           'D_loss': D_loss.item(),
+           }
+    if config['CR'] > 0:
+      out.update({'CR':D_loss_CR.item()})
+    if global_cfg.loss.losstype=='w1':
+      out.update({'GP':reg.item()})
+      
+    #################################################################################Train the  Generator #############################################################################################################
+    # Optionally toggle "requires_grad"
+    if config['toggle_grads']:
+      utils.toggle_grad(D, False)
+      utils.toggle_grad(G, True)
+    # Zero G's gradients by default before training G, for safety
+    G.optim.zero_grad()
+        # If accumulating gradients, loop multiple times
+        
+    for accumulation_index in range(config['num_G_accumulations']):                 ###############################config['num_D_accumulations'] is set to be 1 by default 
+      z_.sample_()
+      y_.sample_()
+      if config['use_MC']:
+         D_fake,D_real,D_fake_mc_sq= GD(z_[:config['batch_size']],y_[:config['batch_size']], 
+                            x[counter-1], y[counter-1], train_G=True, 
+                            split_D=config['split_D'],policy=config['DiffAugment'],mc=True,SQ=config['SQ']>0)#
+         #######LeakyClamp?
+         G_loss =(D_real.clamp(min=-1.2,max=1.2)-D_fake).pow(2).mean()#D_fake_mc#(D_real-D_fake).pow(2).mean()+config['SQ']*(torch.clamp(D_real,min=-1.5,max=1.5).pow(2)-D_fake_mc_sq).pow(2).mean() if config['SQ']>0 else 
+      else:
+        if global_cfg.loss.losstype=='omni':
+          D_fake = GD(z_, y_, train_G=True, split_D=config['split_D'],policy=config['DiffAugment'])####################################################### get D_fake 
+          # G_loss = losses.generator_loss(D_fake)
+          G_fake_positive = (y_, config['n_classes'])
+        # G_fake_negative = (config['n_classes'] + 1,)
+          if global_cfg.loss.mode == 'only_p':
+            G_loss = loss_fn(pred=D_fake, positive=G_fake_positive, default_label=-1)
+          elif global_cfg.loss.mode == 'p_and_n':
+            G_loss = loss_fn(pred=D_fake, positive=G_fake_positive, default_label=0)  ####################################################### get G_loss 
+          elif global_cfg.loss.mode == 'one_side':
+            G_loss = loss_fn(pred=D_fake, positive=G_fake_positive, default_label=-1)
+          else:
+            assert 0
+          G_loss = G_loss / float(config['num_G_accumulations'])
+          
+        elif global_cfg.loss.losstype in ['hinge','ns','w1']:
+          D_fake= GD(z_, y_, train_G=True, split_D=config['split_D'],policy=config['DiffAugment'])#   
+          G_loss = loss_fn(D_fake,train_G=True)/ float(config['num_G_accumulations'])
+          
+      
+      G_loss.backward()
+
+    # Optionally apply modified ortho reg in G
+    if config['G_ortho'] > 0.0:             ###############################################################By default  'G_ortho'=0 
+      print('using modified ortho reg in G') # Debug print to indicate we're using ortho reg in G
+      # Don't ortho reg shared, it makes no sense. Really we should blacklist any embeddings for this
+      utils.ortho(G, config['G_ortho'], 
+                  blacklist=[param for param in G.shared.parameters()])
+    G.optim.step()
+
+    out.update({'G_loss': G_loss.item(), })
+    # out['D_G_fake'] = D_fake.mean().item()
+    
+    # If we have an ema, update it, regardless of if we test with it or not
+    if config['ema']:
+      ema.update(state_dict['itr'])
+      
+      
+#################################################Validate Disciriminator ###################################################################################
+    if val_loaders is not None:
+      val_x, val_y = next(val_loaders)
+      val_x = val_x.to(device)
+      val_y = val_y.to(device)
+      
+      with torch.no_grad():
+        D_val = D(val_x, val_y)
+        
+        if global_cfg.loss.losstype=='omni':
+          D_val_positive = (val_y, config['n_classes'])
+          # D_val_negative = (config['n_classes'] + 1,)
+          if global_cfg.loss.mode == 'only_p':
+            D_val_loss = loss_fn(pred=D_val, positive=D_val_positive, default_label=-1)
+          elif global_cfg.loss.mode == 'p_and_n':
+            D_val_loss = loss_fn(pred=D_val, positive=D_val_positive, default_label=0)
+          elif global_cfg.loss.mode == 'one_side':
+            D_val_loss = loss_fn(pred=D_val, positive=D_val_positive, default_label=-1)
+          else:
+            assert 0
+            
+        if global_cfg.loss.losstype in ['hinge','w1','ns']:
+            D_val_loss=D_val.mean()
+        # D_val_loss = omni_loss(pred=D_val, positive=D_val_positive, negative=D_val_negative)
+        out.update({'D_val_loss': D_val_loss.item(),})
+        
+    default_dict.clear()
+    default_dict['D_loss'].update(out)   #########################################################################return the loss
+    return default_dict
+    
+  return train
+  
+  
+  
+''' This function takes in the model, saves the weights (multiple copies if 
+    requested), and prepares sample sheets: one consisting of samples given
+    a fixed noise seed (to show how the model evolves throughout training),
+    a set of full conditional sample sheets, and a set of interp sheets. '''
+def save_and_sample(G, D, G_ema, z_, y_, fixed_z, fixed_y, 
+                    state_dict, config, experiment_name):
+  utils.save_weights(G, D, state_dict, config['weights_root'],
+                     experiment_name, None, G_ema if config['ema'] else None)
+  device=next(G.parameters()).device
+  # Save an additional copy to mitigate accidental corruption if process
+  # is killed during a save (it's happened to me before -.-)
+  if config['num_save_copies'] > 0:
+    utils.save_weights(G, D, state_dict, config['weights_root'],
+                       experiment_name,
+                       'copy%d' %  state_dict['save_num'],
+                       G_ema if config['ema'] else None)
+    state_dict['save_num'] = (state_dict['save_num'] + 1 ) % config['num_save_copies']
+    
+  # Use EMA G for samples or non-EMA?
+  which_G = G_ema if config['ema'] and config['use_ema'] else G
+  
+  # Accumulate standing statistics?
+  if config['accumulate_stats']:
+    utils.accumulate_standing_stats(G_ema if config['ema'] and config['use_ema'] else G,
+                           z_, y_, config['n_classes'],
+                           config['num_standing_accumulations'])
+  
+  # Save a random sample sheet with fixed z and y      
+  with torch.no_grad():
+    if config['parallel']:
+      fixed_Gz =  nn.parallel.data_parallel(which_G, (fixed_z, which_G.shared(fixed_y)))
+    else:
+      fixed_Gz = which_G(fixed_z, which_G.shared(fixed_y))
+  if not os.path.isdir('%s/%s' % (config['samples_root'], experiment_name)):
+    os.mkdir('%s/%s' % (config['samples_root'], experiment_name))
+  image_filename = '%s/%s/fixed_samples%d.jpg' % (config['samples_root'], 
+                                                  experiment_name,
+                                                  state_dict['itr'])
+  torchvision.utils.save_image(fixed_Gz.float().cpu(), image_filename,
+                             nrow=int(fixed_Gz.shape[0] **0.5), normalize=True)
+  # For now, every time we save, also save sample sheets
+  utils.sample_sheet(which_G,
+                     classes_per_sheet=utils.classes_per_sheet_dict[config['dataset']],
+                     num_classes=config['n_classes'],
+                     samples_per_class=10, parallel=config['parallel'],
+                     samples_root=config['samples_root'],
+                     experiment_name=experiment_name,
+                     folder_number=state_dict['itr'],
+                     z_=z_)
+  # Also save interp sheets
+  for fix_z, fix_y in zip([False, False, True], [False, True, False]):
+    utils.interp_sheet(which_G,
+                       num_per_sheet=16,
+                       num_midpoints=8,
+                       num_classes=config['n_classes'],
+                       parallel=config['parallel'],
+                       samples_root=config['samples_root'],
+                       experiment_name=experiment_name,
+                       folder_number=state_dict['itr'],
+                       sheet_number=0,
+                       fix_z=fix_z, fix_y=fix_y, device=device)
+
+
+  
+''' This function runs the inception metrics code, checks if the results
+    are an improvement over the previous best (either in IS or FID, 
+    user-specified), logs the results, and saves a best_ copy if it's an 
+    improvement. '''
+def test(G, D, G_ema, z_, y_, state_dict, config, sample, get_inception_metrics,
+         experiment_name, test_log):
+  print('Gathering inception metrics...', )
+  if config['accumulate_stats']:
+    utils.accumulate_standing_stats(G_ema if config['ema'] and config['use_ema'] else G,
+                           z_, y_, config['n_classes'],
+                           config['num_standing_accumulations'])
+  IS_mean, IS_std, FID = get_inception_metrics(sample, step=state_dict['shown_images'],
+                                               num_inception_images=config['num_inception_images'],
+                                               num_splits=10)
+  print('shown_images %d: Inception Score is %3.3f +/- %3.3f, FID is %5.4f' %
+        (state_dict['shown_images'], IS_mean, IS_std, FID), )
+  # If improved over previous best metric, save approrpiate copy
+  if not math.isnan(IS_mean) and not math.isnan(FID)\
+        and (IS_mean > state_dict['best_IS']):
+    print('%s improved over previous best, saving checkpoint...' % 'IS', )
+    utils.save_weights(G, D, state_dict, config['weights_root'],
+                       experiment_name, 'best_IS%d' % state_dict['save_best_num'],
+                       G_ema if config['ema'] else None)
+    state_dict['save_best_num'] = (state_dict['save_best_num'] + 1 ) % config['num_best_copies']
+  if not math.isnan(IS_mean) and not math.isnan(FID)\
+          and (FID < state_dict['best_FID']):
+    print('%s improved over previous best, saving checkpoint...' % 'FID', )
+    utils.save_weights(G, D, state_dict, config['weights_root'],
+                       experiment_name, 'best_FID%d' % state_dict['save_best_num'],
+                       G_ema if config['ema'] else None)
+    state_dict['save_best_num'] = (state_dict['save_best_num'] + 1) % config['num_best_copies']
+
+  state_dict['best_IS'] = max(state_dict['best_IS'], IS_mean)
+  state_dict['best_FID'] = min(state_dict['best_FID'], FID)
+  # Log results to file
+  test_log.log(itr=int(state_dict['itr']), IS_mean=float(IS_mean),
+               IS_std=float(IS_std), FID=float(FID))
+  return IS_mean, IS_std, FID

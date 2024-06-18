@@ -1,0 +1,321 @@
+""" BigGAN: The Authorized Unofficial PyTorch release
+    Code by A. Brock and A. Andonian
+    This code is an unofficial reimplementation of
+    "Large-Scale GAN Training for High Fidelity Natural Image Synthesis,"
+    by A. Brock, J. Donahue, and K. Simonyan (arXiv 1809.11096).
+
+    Let's go.
+"""
+import logging
+import os
+import functools
+import math
+import numpy as np
+from tqdm import tqdm, trange
+from easydict import EasyDict
+from collections import defaultdict
+import importlib
+
+import torch
+import torch.nn as nn
+from torch.nn import init
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.nn import Parameter as P
+import torchvision
+
+# Import my stuff 
+import inception_utils
+import utils
+import losses
+from sync_batchnorm import patch_replication_callback
+from template_lib.v2.config_cfgnode import update_parser_defaults_from_yaml
+from template_lib.v2.config_cfgnode import global_cfg, get_dict_str, TLCfgNode
+from template_lib.v2.logger import summary_defaultdict2txtfig
+from template_lib.v2.logger import global_textlogger as textlogger
+
+import template_lib.v2.GAN.evaluation.tf_FID_IS_score
+#
+import random
+
+
+# The main training file. Config is a dictionary specifying the configuration
+# of this training run.
+def run(config,exp_name):
+
+  logger = logging.getLogger('tl')
+  
+
+  # Update the config dict as necessary
+  # This is for convenience, to add settings derived from the user-specified
+  # configuration into the config-dict (e.g. inferring the number of classes
+  # and size of the images from the dataset, passing in a pytorch object
+  # for the activation specified as a string)
+  config['resolution'] = utils.imsize_dict[config['dataset']]
+  config['n_classes'] = utils.nclass_dict[config['dataset']]
+  config['G_activation'] = utils.activation_dict[config['G_nl']]#obtain activation function of G and D
+  config['D_activation'] = utils.activation_dict[config['D_nl']]
+  # By default, skip init if resuming training.
+  if config['resume']:
+    print('Skipping initialization for training resumption...')
+    config['skip_init'] = True
+  config = utils.update_config_roots(config)
+  
+
+  #Specify device
+  print('CUDA is available or not: \n',torch.cuda.is_available())
+  print('Number of AVilable Cuda device: \n',torch.cuda.device_count())
+  device = "cuda" ## specify the GPU id's, GPU id's start from 0.
+  print('Using device: \n',device)
+  
+  #Differentiable Augmentation
+  if config['DiffAugment'] is not None:
+    print('Differentiable Augmentation Policy:\n  ',config['DiffAugment'])
+  else:
+    print('Not Using Differentiable Augmentation Policy')
+
+  # Seed RNG
+  utils.seed_rng(config['seed'])
+
+  # Prepare root folders if necessary
+  utils.prepare_root(config)
+
+  # Setup cudnn.benchmark for free speed
+  torch.backends.cudnn.benchmark = True
+
+  # Import the model--this line allows us to dynamically select different files.
+  model = importlib.import_module(config['model'])  
+  experiment_name = exp_name
+  # experiment_name = (config['experiment_name'] if config['experiment_name'] #############Probaly using this 
+  #                      else utils.name_from_config(config))
+  print('Experiment name is %s' % experiment_name)
+
+  # Next, build the model
+  G = model.Generator(**config, cfg=getattr(global_cfg, 'generator', None)).to(device)
+  D = model.Discriminator(**config, cfg=getattr(global_cfg, 'discriminator', None)).to(device)
+  
+   # If using EMA, prepare it
+  if config['ema']:  #compute  Exponential Moving Average of parameters   ##################True by default 
+    print('Preparing EMA for G with decay of {}'.format(config['ema_decay']))
+    G_ema = model.Generator(**{**config, 'skip_init':True, 
+                               'no_optim': True}, cfg=getattr(global_cfg, 'generator', None)).to(device)
+    ema = utils.ema(G, G_ema, config['ema_decay'], config['ema_start']) ############'--ema_decay', type=float, default=0.9999, ##############ema_start: 5000    
+  else:
+    G_ema, ema = None, None
+  
+  # FP16? ####################probably for saving memory 
+  if config['G_fp16']: #False by default 
+    print('Casting G to float16...')
+    G = G.half()
+    if config['ema']:
+      G_ema = G_ema.half()
+  if config['D_fp16']:
+    print('Casting D to fp16...')
+    D = D.half()
+    # Consider automatically reducing SN_eps?
+  GD = model.G_D(G, D)#,config['seed']
+  logger.info(G)
+  logger.info(D)
+  logger.info('Number of params in G: {} D: {}'.format(
+    *[sum([p.data.nelement() for p in net.parameters()]) for net in [G,D]]))
+  # Prepare state dict, which holds things like epoch # and itr #
+  state_dict = {'itr': 0, 'epoch': 0, 'save_num': 0, 'save_best_num': 0,
+                'best_IS': 0, 'best_FID': 999999, 'config': config,
+                'last_FID': 999999, 'last_IS': 0}
+
+  # If loading from a pre-trained model, load weights
+  if config['resume']:
+    print('Loading weights...')
+    utils.load_weights(G, D, state_dict,
+                       config['weights_root'], experiment_name, 
+                       config['load_weights'] if config['load_weights'] else None,       ####################'load_weights' set to be  'best0', 'copy0'
+                       G_ema if config['ema'] else None)
+                       
+  #For multiple GPUs usage 
+  # If parallel, parallelize the GD module  ####################################################For multiple GPUs usage, FALSE by default 
+  if config['parallel']:
+    GD = nn.DataParallel(GD)
+    if config['cross_replica']:
+      patch_replication_callback(GD)
+  
+  # Prepare loggers for stats; metrics holds test metrics,
+  # lmetrics holds any desired training metrics.
+  test_metrics_fname = '%s/%s_log.jsonl' % (config['logs_root'],
+                                            experiment_name)
+  train_metrics_fname = '%s/%s' % (config['logs_root'], experiment_name)
+  print('Inception Metrics will be saved to {}'.format(test_metrics_fname))
+  test_log = utils.MetricsLogger(test_metrics_fname, 
+                                 reinitialize=(not config['resume']))
+  print('Training Metrics will be saved to {}'.format(train_metrics_fname))
+  train_log = utils.MyLogger(train_metrics_fname, 
+                             reinitialize=(not config['resume']),
+                             logstyle=config['logstyle'])  ###################################Build metric logger and training logger
+  # Write metadata
+  utils.write_metadata(config['logs_root'], experiment_name, config, state_dict)
+  # Prepare data; the Discriminator's batch size is all that needs to be passed
+  # to the dataloader, as G doesn't require dataloading.
+  
+  ###################################################################################Load Dataset###################################################################################
+  #Load traning dataset 
+  D_batch_size = (config['batch_size'] * config['num_D_steps']
+                  * config['num_D_accumulations'])  
+  loaders = utils.get_data_loaders(**{**config, 'batch_size': D_batch_size,
+                                      'start_itr': state_dict['itr'],
+                                      **getattr(global_cfg, 'train_dataloader', {})}
+                                   )
+                                   
+  #Load validation set
+  val_loaders = None
+  if hasattr(global_cfg, 'val_dataloader'):
+    val_loaders = utils.get_data_loaders(**{**config, 'batch_size': config['batch_size'],
+                                            'start_itr': state_dict['itr'],
+                                            **global_cfg.val_dataloader}
+                                         )[0]
+    val_loaders = iter(val_loaders)
+  ###################################################################################Load FID and IS###################################################################################
+  # Prepare inception metrics: FID and IS
+  if global_cfg.get('use_unofficial_FID', False):
+    get_inception_metrics = inception_utils.prepare_inception_metrics(config['dataset'], config['parallel'],
+                                                                      config['no_fid'])
+  else:
+    get_inception_metrics = inception_utils.prepare_FID_IS(global_cfg)
+
+  ##################################################################################Prepare Noise and Label Generator ###################################################################################
+  # Prepare noise and randomly sampled label arrays
+  # Allow for different batch sizes in G
+  G_batch_size = max(config['G_batch_size'], config['batch_size']) ####################################probably should have the same batch size as D 32 in this case 
+  
+  print('G_batch_size is \n:',G_batch_size)
+  print('D_batch_size is \n:',D_batch_size)
+  z_, y_ = utils.prepare_z_y(G_batch_size, G.dim_z, config['n_classes'],
+                             device=device, fp16=config['G_fp16'])
+                             
+  # Prepare a fixed z & y to see individual sample evolution throghout training
+  fixed_z, fixed_y = utils.prepare_z_y(G_batch_size, G.dim_z,
+                                       config['n_classes'], device=device,
+                                       fp16=config['G_fp16'])  
+  fixed_z.sample_()
+  fixed_y.sample_()
+  ##################################################################################Prepare Training function###################################################################################
+  # Loaders are loaded, prepare the training function
+  # get train function 
+  train_fns = importlib.import_module(config['which_train_fn'])
+  train = train_fns.GAN_training_function(G, D, GD, z_, y_,
+                                          ema, state_dict, config, val_loaders)
+  # Prepare Sample function for use with inception metrics
+  sample = functools.partial(utils.sample_imgs,
+                              G=(G_ema if config['ema'] and config['use_ema']
+                                 else G),
+                              z_=z_, y_=y_, config=config)
+
+  state_dict['shown_images'] = state_dict['itr'] * D_batch_size
+  ##################################################This part is used for evaluation mode  exit(0) as finish##########################################################################
+  #For eval mode
+  if 'eval_cfg' in global_cfg and global_cfg.eval_cfg.eval:
+    print('\n' + config['tl_outdir'])
+    logger.info(f'Loading model:\n {global_cfg.eval_cfg.path}')
+    print(os.path.expanduser(global_cfg.eval_cfg.path))
+    G_ema.load_state_dict(torch.load(os.path.expanduser(global_cfg.eval_cfg.path)), strict=True)
+    state_dict['best_IS'] = float('inf')
+    state_dict['best_FID'] = 0
+    IS_mean, IS_std, FID = train_fns.test(G, D, G_ema, z_, y_, state_dict, config, sample,
+                                          get_inception_metrics, experiment_name, test_log)
+    exit(0)
+  ##################################################Training the model##########################################################################
+  #Training mode
+  print('Beginning training at epoch %d...' % state_dict['epoch'])
+  # Train for specified number of epochs, although we mostly track G iterations.
+  # 
+  for epoch in range(state_dict['epoch'], config['num_epochs']):    
+    if 'search_epoch' in global_cfg and epoch >= global_cfg.search_epoch:
+      break
+
+    # Which progressbar to use? TQDM or my own?
+    if config['pbar'] == 'mine':
+      pbar = utils.progress(loaders[0], desc=f'Epoch:{epoch}, Itr: ',
+                            displaytype='s1k' if config['use_multiepoch_sampler'] else 'eta')
+    else:
+      pbar = tqdm(loaders[0])
+
+    for i, (x, y) in enumerate(pbar):
+      # Increment the iteration counter
+      state_dict['itr'] += 1
+      # Make sure G and D are in training mode, just in case they got set to eval
+      # For D, which typically doesn't have BN, this shouldn't matter much.
+      G.train()
+      D.train()
+      if config['ema']:
+        G_ema.train()
+      if config['D_fp16']:
+        x, y = x.to(device).half(), y.to(device)
+      else:
+        x, y = x.to(device), y.to(device)
+
+      default_dict = train(x, y)#MAIN TRAINING PROCUDURE  #####################default dict contains the train and val loss
+      ############################################################################Store the metrics ################################################################################
+      state_dict['shown_images'] += D_batch_size
+
+      metrics = default_dict['D_loss']
+      summary_defaultdict2txtfig(default_dict=default_dict, prefix='train', step=state_dict['shown_images'],
+                                 textlogger=textlogger)
+      #Perhaps log the loss during the training 
+      #train_log.log(itr=int(state_dict['itr']), **{**default_dict})    ######################################Track the SINGULAR VALUE of the Discriminator and Generator ##########################################
+      ###############   Every sv_log_interval, log singular values           #
+      if (config['sv_log_interval'] > 0) and (not (state_dict['itr'] % config['sv_log_interval'])):
+        train_log.log(itr=int(state_dict['itr']), **{**utils.get_SVs(G, 'G'), **utils.get_SVs(D, 'D')})    ######################################Track the SINGULAR VALUE of the Discriminator and Generator ##########################################
+
+      ############### If using my progbar, print metrics.
+      if config['pbar'] == 'mine':
+          print(', '.join(['itr: %d' % state_dict['itr']] 
+                           + ['%s : %+4.3f' % (key, metrics[key]) for key in metrics]), end=' ', flush=True)
+
+      ###################################################################### Save weights and copies as configured at specified interval###############################################################################
+      if (state_dict['itr'] % config['save_every'] == 0 or state_dict['itr'] == 1) \
+            and 'search_epoch' not in global_cfg:
+        if config['G_eval_mode']:
+          print('Switchin G to eval mode...')
+          G.eval()
+          if config['ema']:
+            G_ema.eval()
+        train_fns.save_and_sample(G, D, G_ema, z_, y_, fixed_z, fixed_y, 
+                                  state_dict, config, experiment_name)
+
+      ##################################################################### Test every specified interval######################################################
+      if (config['test_every'] > 0 and state_dict['itr'] % config['test_every'] == 0) or \
+            state_dict['itr'] == 1 or \
+            (state_dict['shown_images'] % global_cfg.get('test_every_images', float('inf'))) < D_batch_size:
+        if config['G_eval_mode']:
+          print('Switchin G to eval mode...', flush=True)
+          G.eval()
+          if config['ema']:
+             G_ema.eval()
+        print('\n' + config['tl_outdir'])
+        IS_mean, IS_std, FID = train_fns.test(G, D, G_ema, z_, y_, state_dict, config, sample,
+                                              get_inception_metrics, experiment_name, test_log)
+        state_dict['last_FID'] = FID
+        state_dict['last_IS'] = IS_mean
+
+    # Increment epoch counter at end of epoch 
+    state_dict['epoch'] += 1
+
+
+def main():
+  logger = logging.getLogger('tl')
+  # parse command line
+  parser = utils.prepare_parser()
+
+  update_parser_defaults_from_yaml(parser)
+  #print('print default \n',dict(parser.parse_args())) 
+  args = parser.parse_args()
+  #args.tl_outdir= os.path.join(args.tl_outdir,exp)
+  args.base_root =args.tl_outdir
+  opt = EasyDict(vars(args))
+  #print(opt)
+
+  logger.info(f"\nglobal_cfg: \n" + get_dict_str(global_cfg))
+  global_cfg.dump_to_file_with_command(f"{opt.tl_outdir}/config_command.yaml", command=opt.tl_command)
+  exp=args.tl_outdir.split('/')[1]
+  run(opt,exp)
+
+if __name__ == '__main__':
+  main()

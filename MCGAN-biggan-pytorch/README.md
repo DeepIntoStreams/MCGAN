@@ -19,7 +19,7 @@ pip install -r requirements.txt
 
 ### Prepare FID statistics files
 
-The FID statistics files calculated on CIFAR10 and CIFAR100 are provided by  [Omni-GAN-PyTorch](https://github.com/PeterouZh/Omni-GAN-PyTorch) at [OneDrive](https://sjtueducn-my.sharepoint.com/:f:/g/personal/zhoupengcv_sjtu_edu_cn/Ek0QSX1UhylDjVYdmXYxRtcBMLs54AYD4E3CwZlWBXZmPA?e=BzWa9D). Download them and put them into the `datasets` dir. 
+The FID statistics files calculated on CIFAR10 and CIFAR100 are provided at [OneDrive](https://liveuclac-my.sharepoint.com/:f:/g/personal/ucahxia_ucl_ac_uk/En8_4L0u4kBDhL6v9Zr2GagBIzs4Rz3MOu3BljUtEwEbeQ?e=ywSgnd). Download them and put them into the `datasets` dir. 
 
 ### Train the model 
 - CIFAR10

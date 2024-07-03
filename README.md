@@ -2,7 +2,7 @@
 
 Monte Carlo GAN (MCGAN) is a novel framework that incorporates mean squared error (MSE) and the Monte Carlo method into the generative loss function. This innovative generative loss function provides strong supervision to guide the generator training and enhance its performance. 
 
-Authors: Baoren Xiao, Hao Ni
+Authors: Baoren Xiao, Hao Ni and Weixin Yang
 
 Paper Link: 
 

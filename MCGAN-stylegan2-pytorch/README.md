@@ -14,7 +14,14 @@ python generate_gif.py --output=obama.gif --seed=0 --num-rows=1 --num-cols=8 --n
 
 ## Train MCGAN
 
-To train an MCGAN on CIFAR-10 dataset, use the following line:
+To train an MCGAN on CIFAR-10 dataset
+Download the [CIFAR-10 python version](https://www.cs.toronto.edu/~kriz/cifar.html) and convert to ZIP archive:
+
+```.bash
+python dataset_tool.py --source=~/downloads/cifar-10-python.tar.gz --dest=~/datasets/cifar10.zip
+```
+
+then run the following line:
 ```bash
 python train.py --outdir=training-runs/MCGAN --data=datasets/cifar10.zip --gpus=4 --mc_size=4 
 ```

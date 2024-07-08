@@ -40,7 +40,7 @@ def run(config):
     dir_path = make_dir(algo,p,q,d_per_g,root=root_dir)
 
     #load dataset
-    movingmnist = np.load('data/OLD/mnist_test_seq.npy')[-num_frames:,:train_size + val_size] #(T,B,H,W) to [0,1]
+    movingmnist = np.load('data/mnist_test_seq.npy')[-num_frames:,:train_size + val_size] #(T,B,H,W) to [0,1]
     #downsample
     downsample = 64//frame_size
     movingmnist = movingmnist[:,:,::downsample,::downsample]/255

@@ -8,4 +8,4 @@ After you download the .npy data, put it under folder ./data then run
 ```
 python train.py -use_cuda
 ```
-If you have no GPU, ignore the ```-use_cuda`` keyword.
+If you have no GPU, ignore the ```-use_cuda``` keyword.

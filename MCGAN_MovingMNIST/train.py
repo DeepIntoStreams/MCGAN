@@ -13,6 +13,7 @@ from tqdm import tqdm
 from collections import defaultdict
 import pickle 
 
+#Fix the seed
 torch.manual_seed(0)
 np.random.seed(0)
 
@@ -34,16 +35,16 @@ def run(config):
     train_size, val_size = 9000, 1000
 
     ## Training loop
-    num_epochs = config.num_epochs#10000
-    batch_size = config.batch_size# 16
-    d_per_g = config.d_per_g#1
+    num_epochs = config.num_epochs
+    batch_size = config.batch_size
+    d_per_g = config.d_per_g 
 
-    ## make dir
+    # make dir depending on parameters
     dir_path = make_dir(algo,p,q,d_per_g,root=root_dir)
 
     #load dataset
     movingmnist = np.load('data/mnist_test_seq.npy')[-num_frames:,:train_size + val_size] #(T,B,H,W) to [0,1]
-    #downsample
+    #downsample original size: 64
     downsample = 64//frame_size
     movingmnist = movingmnist[:,:,::downsample,::downsample]/255
 
@@ -63,15 +64,16 @@ def run(config):
 
     #to torch tensor
     data_raw = torch.from_numpy(np.swapaxes(movingmnist, 0,1)[:,:,None]).to(device).float()# (B,T,1,H,W) scale [0,1]
-    print(data_raw.max(),data_raw.min())
+    print('Max and min for raw data:',data_raw.max(),data_raw.min())
     channels = data_raw.shape[2]
 
-    #data transform
+    #data transformation
     data_processed = torch.stack([data_transforms(data) for data in data_raw]) 
+    #train/test split
     train_data, valid_data = data_processed [:train_size], data_processed [train_size:]
-
-    print(data_processed .max(),data_processed .min())
-    print('datasize:',data_processed.shape, 'trainsize',data_processed.shape,'testsize',data_processed.shape)
+    
+    print('Max and min for processed data:', data_processed .max(),data_processed .min())
+    print('datasize: ',data_processed.shape, 'trainsize: ',data_processed.shape,'testsize:',data_processed.shape)
 
     # Build Model 
     from lib.networks import Generator_LSTM,Discriminator_LSTM
@@ -84,7 +86,6 @@ def run(config):
                 frame_size=(frame_size, frame_size), num_layers=config.G_num_layers, 
                 num_frames=q,
                 device= device)
-
 
     D_config = dict(num_channels=channels,
                 num_kernels=hidden_dim,
@@ -104,7 +105,7 @@ def run(config):
     discriminator = Discriminator_LSTM(**D_config).to(device)
 
     # Loss function
-    adversarial_loss = nn.BCEWithLogitsLoss()# nn.BCELoss()#
+    adversarial_loss = nn.BCEWithLogitsLoss()#
 
     # Optimizers
     optimizer_G = optim.Adam(generator.parameters(), lr=0.0002, betas=(0.5, 0.999))
@@ -118,7 +119,7 @@ def run(config):
         optimizer_D.zero_grad()
         # get real samples 
         indx = sample_indices(train_size, batch_size,device)
-        # Real videos
+        # Get Real videos
         real_videos = train_data[indx] # Load a batch of real videos
         real_labels = torch.ones((batch_size, 1), requires_grad=False).to(device)
         real_noise = torch.randn((batch_size, q, 1,frame_size,frame_size), requires_grad=False).to(device)*0.0005
@@ -133,8 +134,7 @@ def run(config):
         # Discriminator loss on real and fake videos
         d_real = discriminator(real_videos+real_noise)
         d_fake = discriminator(fake_videos.detach())
-
-
+        
         # BCE LOSS 
         real_loss = adversarial_loss(d_real, real_labels)
         fake_loss = adversarial_loss(d_fake, fake_labels)
@@ -143,7 +143,6 @@ def run(config):
         optimizer_D.step()
 
         
-
         if epoch % d_per_g == 0:
             # Train Generator
             optimizer_G.zero_grad()
@@ -172,7 +171,7 @@ def run(config):
             loss_history['d_fake'].append(d_fake.mean().item())
             loss_history['g_loss'].append(g_loss.item())
 
-        # for eachj 500 epoch save samples and compute test metrics
+        # for eachj 500 epoch save samples and compute validation metrics
         if epoch % 500 == 0:
             if epoch == 0:
                 print('X_real shape and X_fake shape', real_videos.shape, fake_videos.shape)

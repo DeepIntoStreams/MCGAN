@@ -17,7 +17,7 @@ torch.manual_seed(0)
 np.random.seed(0)
 
 def run(config):
-
+    # get parameters 
     algo = config.algo
     dataset = config.dataset
     root_dir = config.root_dir
@@ -27,8 +27,10 @@ def run(config):
     p,q = config.p,config.q 
     num_frames = p+q
 
+    #find the best gpu based on their memeory left 
     device = find_best_gpus(1)[0] if config.use_cuda and torch.cuda.is_available() else 'cpu' 
-    #
+    
+    #set the train size and val size
     train_size, val_size = 9000, 1000
 
     ## Training loop
@@ -210,8 +212,8 @@ if __name__ == '__main__':
     parser.add_argument('-use_cuda',  action='store_true')
     parser.add_argument('-dataset', default='movingmnist', nargs="+")
     
-    # algo list 'SigCWGAN','MCGAN','SigMCGAN','GMMN', 'RCGAN', 'TimeGAN', 'RCWGAN'
-    parser.add_argument('-algo', default = 'GAN', nargs="+")#'SigCWGAN',
+    #algo keyword supports only 'GAN' and 'MCGAN'
+    parser.add_argument('-algo', default = 'GAN', nargs="+")#
     parser.add_argument('-latent_dim', default = 128, type=int)
     parser.add_argument('-num_epochs', default = 10000, type=int)
     parser.add_argument('-batch_size', default = 16, type=int)

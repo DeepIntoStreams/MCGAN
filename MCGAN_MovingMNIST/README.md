@@ -6,5 +6,6 @@ Moving MNIST [782Mb] contains 10,000 sequences each of length 20 showing 2 digit
 
 After you download the .npy data, put it under folder ./data then run 
 ```
-python train.py
+python train.py -use_cuda
 ```
+If you have no GPU, ignore the ```-use_cuda`` keyword.

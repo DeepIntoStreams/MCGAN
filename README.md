@@ -48,10 +48,10 @@ where $f_1,f_2$ are two functions determined by the specified discriminative los
 | BCE + MC | 10.100 | 2.360 | 11.300 |
 
 ## Test metrics on on large-scale and high-resolution datasets using StyleGAN2-ada
-| Dataset            | Method    | FID $\downarrow$ | IS $\uparrow$ | Precision$\uparrow$ | Recall $\uparrow$ |
+| Dataset            | Method    | FID $\downarrow$ | IS $\uparrow$ | Precision $\uparrow$| Recall $\uparrow$ |
 |--------------------|-----------|------------------|---------------|---------------------|-------------------|
-| **FFHQ256**        | original | 4.51 $\pm$ 0.03  | 5.10 $\pm$ 0.07 | **0.69**             | 0.40              |
-|                    | +MC      | **3.77} $\pm$ 0.04| **5.25** $\pm$ 0.06 | 0.69                 | **0.45**           |
+| **FFHQ256**        | original | 4.51 $\pm$ 0.03  | 5.10 $\pm$ 0.07 | **0.69**           | 0.40              |
+|                    | +MC      | **3.77** $\pm$ 0.04| **5.25** $\pm$ 0.06 | 0.69                 | **0.45**           |
 | **ImageNet64**     | original | 19.83 $\pm$ 0.02  | 13.67 $\pm$ 0.17| **0.65**             | 0.33              |
 |                    | +MC      | **16.76** $\pm$ 0.08 | **13.96** $\pm$ 0.22 | 0.63               | **0.43**           |
 | **LSUN bedroom**   | original | 4.34 $\pm$ 0.03  | 2.45 $\pm$ 0.02 | 0.57                 | 0.22              |

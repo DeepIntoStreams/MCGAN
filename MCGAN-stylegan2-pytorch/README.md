@@ -13,7 +13,7 @@ python generate_gif.py --output=obama.gif --seed=0 --num-rows=1 --num-cols=8 --n
 ```
 
 ## Train MCGAN
-
+### CIFAR-10
 To train an MCGAN on CIFAR-10 dataset
 Download the [CIFAR-10 python version](https://www.cs.toronto.edu/~kriz/cifar.html) and convert to ZIP archive:
 
@@ -25,5 +25,41 @@ then run the following line:
 ```bash
 python train.py --outdir=training-runs/MCGAN --data=datasets/cifar10.zip --gpus=4 --mc_size=4 
 ```
+
+### CIFAR-10
+To train an MCGAN on CIFAR-10 dataset
+Download the [CIFAR-10 python version](https://www.cs.toronto.edu/~kriz/cifar.html) and convert to ZIP archive:
+
+```.bash
+python dataset_tool.py --source=~/downloads/cifar-10-python.tar.gz --dest=~/datasets/cifar10.zip
+```
+
+then run the following line:
+```bash
+python train.py --outdir=training-runs/MCGAN --data=datasets/cifar10.zip --gpus=4 --mc_size=4 
+``` 
+### FFHQ256
+Run the following line for 4 gpus:
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 python train.py --outdir=training-runs/ffhq256 --data=data/ffhq256x256.zip --cfg=stylegan2 --gpus=4 --batch=32 --gamma=1 --mirror=1 --glr=0.0025 --dlr=0.0025 --cbase=16384 --mc_size 1
+```
+
+### Imagenet64
+Run the following line for 4 gpus:
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 python train.py --outdir=training-runs/imagenet64 --data=data/imagenet64.zip --cfg=stylegan2 --gpus=4 --batch=64 --gamma=0.0128 --map-depth=2 --glr=0.0025 --dlr=0.0025 --cbase=16384 --cond=1 --snap=100 --mc_size 1
+```
+
+### LSUN bedroom 256:
+Run the following line for 4 gpus:
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 python train.py --outdir=training-runs/lsunbed --data=data/lsun_bedroom_256 --cfg=stylegan2 --gpus=4 --batch=32 --gamma=10 --mirror=1 --glr=0.0025 --dlr=0.0025 --cbase=16384 --mc_size 1
+```
+
+
+
+
+
+
 
 
